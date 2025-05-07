@@ -1,0 +1,12 @@
+ROOT_DIR = 'sam2'
+BASE_DIR = 'sam2'
+
+OUTPUT_DIR = 'output'
+
+
+
+MIN_AREA_PX = 100
+ASPECT_MIN = 1.5
+ASPECT_MAX = 2.2
+VERTEX_MIN = 4
+VERTEX_MAX = 4
