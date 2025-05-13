@@ -1,6 +1,9 @@
 ROOT_DIR = 'sam2'
 BASE_DIR = 'sam2'
 
+
+RESNET_WEIGHTS = 'RetinaNet_ResNet50_FPN_Weights.COCO_V1'
+
 OUTPUT_DIR = 'output'
 
 MIN_AREA_PX = 100
