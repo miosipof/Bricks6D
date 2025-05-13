@@ -4,7 +4,7 @@ import logging
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from resources.constants import MIN_AREA_PX, ASPECT_MIN, ASPECT_MAX, VERTEX_MIN, VERTEX_MAX
+from resources.constants import MIN_AREA_PX, ASPECT_MIN, ASPECT_MAX, VERTEX_MIN, VERTEX_MAX, BRICK_SIZE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -363,12 +363,387 @@ class VertexSolver:
         plt.show()
 
 
+class Model3D:
+    def __init__(self):
+        self.brick_dims = BRICK_SIZE
+
+    def analyze_faces(self, image_pts: np.ndarray):
+        """
+        Analyze projected brick faces by edge angles and 2D area to identify best face candidate.
+
+        Parameters
+        ----------
+        image_pts : (7,2) float32 – polygon vertices including center (index 6)
+
+        Returns
+        -------
+        face_stats : list of dict – each with 'name', 'angle_deg', 'area', 'ratio'
+        best_face  : dict         – face most orthogonal (angle ≈ 90°)
+        """
+
+        # Define edges and face pairs (by index into image_pts)
+        # edge_pairs = [
+        #     ((0,6), (1,2)),   # front face
+        #     ((0,1), (6,2)),   # top face
+        #     ((2,6), (3,4)),   # right face
+        #     ((2,3), (6,4)),   # angled face
+        #     ((4,6), (0,5)),   # left face
+        #     ((4,5), (0,6))    # bottom face
+        # ]
+        edge_pairs = [
+            ((0,6), (1,2)),   # front face
+            # ((0,1), (6,2)),   # top face
+            ((2,6), (3,4)),   # right face
+            # ((2,3), (6,4)),   # angled face
+            ((4,6), (0,5)),   # left face
+            # ((4,5), (0,6))    # bottom face
+        ]        
+
+        def vector(p1, p2):
+            return image_pts[p2] - image_pts[p1]
+
+        def angle_between(u, v):
+            u = u / np.linalg.norm(u)
+            v = v / np.linalg.norm(v)
+            dot = np.clip(np.dot(u, v), -1, 1)
+            return np.arccos(dot)
+
+        def face_area(p1, p2, p3, p4):
+            quad = np.array([image_pts[p1], image_pts[p2], image_pts[p3], image_pts[p4]])
+            # Split into two triangles for robust area
+            a1 = 0.5 * np.abs(np.cross(quad[1] - quad[0], quad[2] - quad[0]))
+            a2 = 0.5 * np.abs(np.cross(quad[2] - quad[0], quad[3] - quad[0]))
+            return a1 + a2
+
+        face_stats = []
+
+        for ((i1, i2), (j1, j2)) in edge_pairs:
+            v1 = vector(i1, i2)
+            v2 = vector(i1, j1)
+            angle = angle_between(v1, v2)
+            angle_deg = np.degrees(angle)
+            print(f"({(i1, i2)})-{(i1, j1)}: {angle_deg}")
+            
+
+            # Estimate quadrilateral formed by (i1, i2, j2, j1)
+            area = face_area(i1, i2, j2, j1)
+            ratio = np.linalg.norm(vector(i1, i2)) / np.linalg.norm(vector(j1, j2))
+
+            face_stats.append({
+                "angle_deg": angle_deg,
+                "area": area,
+                "ratio": ratio,
+                "edge_pair": ((i1, i2), (j1, j2))
+            })
+
+        # Select face with angle closest to 90°
+        best_face = min(face_stats, key=lambda f: abs(f["angle_deg"] - 90))
+
+        return face_stats, best_face
+
+    def get_brick_center(
+        self,
+        image_vertices: np.ndarray,
+        depth_map: np.ndarray,
+        intrinsics: dict
+    ):
+        """
+        Determines the most front-facing face from a 6-vertex polygon and computes the camera-to-brick geometry.
+
+        Returns
+        -------
+        image_pts      : (6,2) float32   pixel coordinates (CCW)
+        object_pts     : (6,3) float32   inferred 3D coordinates
+        orientation_ok : bool           winding consistency
+        ray_centroid   : (3,) float64   unit ray from camera to centroid
+        depth_c        : float          depth at centroid (may be NaN)
+        face_type      : str            e.g. "a-b", "a-c", or "b-c"
+        """
+
+        def poly_area_2d(pts):
+            pts = np.vstack([pts, pts[0]])
+            return 0.5 * np.sum(pts[:-1, 0] * pts[1:, 1] - pts[1:, 0] * pts[:-1, 1])
+
+        def face_normal_3d(pts):
+            v1 = pts[1] - pts[0]
+            v2 = pts[2] - pts[0]
+            return np.cross(v1, v2)
+
+        a, b, c = sorted(self.brick_dims, reverse=True)
+        image_pts = image_vertices.astype(np.float32)
+
+        face_stats, best_face = self.analyze_faces(image_pts)
+
+        print(f"Best face: {best_face}")
+        print(f"Edge pair: {best_face['edge_pair']}")
+        # Step 2: Estimate edge ratio for this face
+        i1, i2 = best_face['edge_pair'][0]
+        j1, j2 = best_face['edge_pair'][1]
+
+        l1 = np.linalg.norm(image_pts[i1] - image_pts[i2])
+        l2 = np.linalg.norm(image_pts[i1] - image_pts[j1])
+        edge_ratio = max(l1, l2) / min(l1, l2)
+        print(f"Best pair edge_ratio: {edge_ratio}")
+
+        ratios_diff = {
+            "a-b": abs(max(a, b) / min(a, b) - edge_ratio),
+            "a-c": abs(max(a, c) / min(a, c) - edge_ratio),
+            "b-c": abs(max(b, c) / min(b, c) - edge_ratio)
+        }
+
+        print(f"a/b/c ratios: {ratios_diff}")
+
+        face_type = min(ratios_diff, key=ratios_diff.get)
+
+        print(f"Identified face type: {face_type}")
+
+        # Step 3: Assign 3D box corners based on face type
+        face_dims = {
+            "a-b": (a, b, c),
+            "a-c": (c, a, b),
+            "b-c": (b, c, a)
+        }
+
+        a_, b_, c_ = face_dims[face_type]
+
+        object_pts = np.array([
+            [0, 0, 0],
+            [a_, 0, 0],
+            [a_, b_, 0],
+            [a_, b_, c_],
+            [0, b_, c_],
+            [0, 0, c_]
+        ], dtype=np.float32)
+
+        # Orientation check
+        area2d = poly_area_2d(image_pts)
+        normal3d_z = face_normal_3d(object_pts)[2]
+        orientation_ok = (area2d > 0 and normal3d_z > 0) or (area2d < 0 and normal3d_z < 0)
+
+        # Ray and depth
+        fx, fy, cx, cy = (intrinsics[k] for k in ("fx", "fy", "cx", "cy"))
+        uc, vc = image_pts.mean(axis=0)
+        ray = np.array([(uc - cx) / fx, (vc - cy) / fy, 1.0])
+        ray /= np.linalg.norm(ray)
+
+        H, W = depth_map.shape
+        u_int, v_int = int(round(uc)), int(round(vc))
+        depth_c = np.nan
+        if 0 <= v_int < H and 0 <= u_int < W:
+            depth_c = float(depth_map[v_int, u_int])
+
+        return image_pts, object_pts, orientation_ok, ray, depth_c, face_type
+
+
+
+    def solve_brick_pose(self,
+                         image_pts: np.ndarray,
+                        object_pts: np.ndarray,
+                        intrinsics: dict,
+                        depth_centroid: float,
+                        ray_to_centroid: np.ndarray,
+                        depth_tol: float = 0.02):
+        """
+        Solve 6‑DoF pose of the brick given 2‑D/3‑D correspondences and a depth prior.
+
+        Parameters
+        ----------
+        image_pts       : (N,2) float32   – pixel coordinates (CCW order)
+        object_pts      : (N,3) float32   – matching brick coordinates in metres
+        intrinsics      : dict            – {"fx":..,"fy":..,"cx":..,"cy":..}
+        depth_centroid  : float           – depth (m) at polygon centroid
+        ray_to_centroid : (3,) float64    – unit vector camera → centroid
+        depth_tol       : float           – acceptable |t|-depth error fraction
+
+        Returns
+        -------
+        R   : (3,3)  rotation matrix (camera→brick)
+        t   : (3,1)  translation vector (metres)
+        n   : (3,)   outward normal (unit, pointing toward camera)
+        """
+        fx, fy, cx, cy = (intrinsics[k] for k in ("fx","fy","cx","cy"))
+
+        K = np.array([[fx, 0, cx],
+                    [0, fy, cy],
+                    [0,  0,  1]], dtype=np.float64)
+
+        # --- initial PnP -------------------------------------------------------
+        if len(image_pts) == 4:
+            flag = cv2.SOLVEPNP_IPPE_SQUARE
+        else:
+            flag = cv2.SOLVEPNP_ITERATIVE
+
+        ok, rvec, tvec = cv2.solvePnP(
+            object_pts, image_pts, K, None,
+            flags=flag
+        )
+        # ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+        #     object_pts, image_pts, K, None,
+        #     flags=flag,
+        #     reprojectionError=4.0,
+        #     confidence=0.99,
+        #     iterationsCount=100
+        # )
+
+        if not ok:
+            raise RuntimeError("Initial solvePnP failed")
+
+        # --- enforce depth -----------------------------------------------------
+        t_norm = np.linalg.norm(tvec)
+        if not np.isnan(depth_centroid) and abs(t_norm - depth_centroid) > depth_tol * depth_centroid:
+            scale = depth_centroid / t_norm
+            tvec *= scale  # scale translation to match measured depth
+
+
+
+        # (Optional) refine rotation with translation fixed
+        ok2, rvec, _ = cv2.solvePnP(
+            object_pts, image_pts, K, None,
+            useExtrinsicGuess=True,
+            rvec=rvec, tvec=tvec,
+            flags=flag
+        )
+
+        R, _ = cv2.Rodrigues(rvec)
+
+        # --- face normal (3rd column) -----------------------------------------
+        n = R[:, 2]
+        # ensure normal points toward camera (n·t < 0)
+        if np.dot(n.flatten(), tvec.flatten()) > 0:
+            n = -n
+
+        return R, tvec, n
+
+
+    def project_brick(self, R, tvec, normal, img_pts, obj_pts, intrinsics, image_pil):
+
+        # Reproject the 3D object points to 2D image points
+
+        rvec, _ = cv2.Rodrigues(R)  # Convert rotation matrix to rotation vector
+
+        # Project the 3D points using the camera intrinsics and pose
+        projected_pts, _ = cv2.projectPoints(
+            objectPoints=obj_pts,
+            rvec=rvec,
+            tvec=tvec,
+            cameraMatrix=np.array([
+                [intrinsics["fx"], 0, intrinsics["cx"]],
+                [0, intrinsics["fy"], intrinsics["cy"]],
+                [0, 0, 1]
+            ]),
+            distCoeffs=None
+        )
+        # Flatten projected points for drawing
+        projected_pts = projected_pts.squeeze().astype(np.int32)
+
+        # Create canvas for visualization
+        canvas = np.array(image_pil)
+
+        # Draw reprojected polygon
+        cv2.polylines(canvas, [projected_pts.reshape(-1, 1, 2)], isClosed=True, color=(0, 0, 255), thickness=2)
+
+        # Draw original image polygon
+        cv2.polylines(canvas, [img_pts.astype(int).reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        # Display
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(6, 6))
+        plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        plt.title("Projected 3D Brick Pose (Red) vs. Original Image Polygon (Green)")
+        plt.axis("off")
+        plt.show()
+
+
+
+
+    def draw_vertex_labels(self, image_pil, image_pts, object_pts):
+        """
+        Draws numbered circles on the image at image_pts locations and displays image_pts ↔ object_pts mapping.
+
+        Parameters
+        ----------
+        image       : (H,W,3) BGR image
+        image_pts   : (N,2) float32 pixel coordinates
+        object_pts  : (N,3) float32 3D brick coordinates
+        """
+        canvas = np.array(image_pil)
+
+        for i, pt in enumerate(image_pts):
+            u, v = int(pt[0]), int(pt[1])
+            cv2.circle(canvas, (u, v), radius=5, color=(0, 255, 0), thickness=-1)
+            cv2.putText(canvas, str(i), (u + 8, v - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
+        # Print 2D–3D mapping clearly
+        print(" Index |  image_pts (u, v)   |  object_pts (x, y, z)")
+        print("-------+---------------------+------------------------")
+        for i, (img_pt, obj_pt) in enumerate(zip(image_pts, object_pts)):
+            u, v = img_pt
+            x, y, z = obj_pt
+            print(f"  {i:>3}  |  ({u:7.1f}, {v:7.1f})  |  ({x:6.3f}, {y:6.3f}, {z:6.3f})")
+
+        # Show the image
+        plt.figure(figsize=(6, 6))
+        plt.imshow(cv2.cvtColor(canvas.astype(np.uint8), cv2.COLOR_BGR2RGB))
+        plt.title("2D Vertex Indices and 3D Mapping")
+        plt.axis("off")
+        plt.show()
+
+
+    def draw_normal_vector(self, image_pil, tvec, normal, intrinsics, length=0.05, color=(0, 0, 255), thickness=2):
+        """
+        Projects and draws the 3D surface normal onto a 2D image.
+
+        Parameters
+        ----------
+        image       : np.ndarray   – Input image (BGR or grayscale)
+        tvec        : (3,1) float  – Translation vector from solvePnP (brick center in camera frame)
+        normal      : (3,) float   – Unit normal vector in camera coordinates
+        intrinsics  : dict         – {"fx", "fy", "cx", "cy"}
+        length      : float        – Arrow length in meters (default 5 cm)
+        color       : (B,G,R)      – Arrow color (default red)
+        thickness   : int          – Arrow thickness (default 2)
+        """
+
+        # Convert intrinsics to matrix
+        fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
+        K = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0,  0,  1]
+        ], dtype=np.float64)
+
+        # Project 3D center and tip of normal
+        tip3D = (tvec.reshape(3) + length * normal).reshape(3, 1)
+        tvec = tvec.reshape(3, 1)
+
+        pt1, _ = cv2.projectPoints(tvec, np.zeros(3), np.zeros(3), K, None)
+        pt2, _ = cv2.projectPoints(tip3D, np.zeros(3), np.zeros(3), K, None)
+
+        p1 = tuple(pt1[0, 0].astype(int))
+        p2 = tuple(pt2[0, 0].astype(int))
+
+        # Prepare canvas
+        canvas = np.array(image_pil)
+        if len(canvas.shape) == 2 or canvas.shape[2] == 1:
+            canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+
+        # Draw arrow
+        cv2.arrowedLine(canvas, p1, p2, color=color, thickness=thickness, tipLength=0.1)
+
+        # Display
+        plt.figure(figsize=(8, 6))
+        plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        plt.title("Projected Normal Vector")
+        plt.axis("off")
+        plt.show()
 
 
 
 
 """
-Helper functions
+Helper functions 2D
 """
 
 def _to_xy(poly):
@@ -431,3 +806,18 @@ def _line(p, q): return np.cross(_h(p), _h(q))
 def _intersection(l1, l2, eps=1e-7):
     p = np.cross(l1, l2)
     return None if abs(p[2]) < eps else p[:2]/p[2]
+
+
+
+"""
+Helper functions 3D
+"""
+
+def poly_area_2d(pts):
+    xy = np.vstack([pts, pts[0]])
+    return 0.5*np.sum(xy[:-1,0]*xy[1:,1] - xy[1:,0]*xy[:-1,1])
+
+def face_normal_3d(pts):
+    v1 = pts[1]-pts[0]
+    v2 = pts[2]-pts[0]
+    return np.cross(v1,v2)
