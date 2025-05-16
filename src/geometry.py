@@ -78,7 +78,7 @@ class Model2D():
 
     def create_hexagon(self, poly, prefer_six=True, angle_tol=np.deg2rad(15)):
         """
-        Sanitize / simplify a polygon to 4 or 6 vertices.
+        Sanitize / simplify a polygon to 4 vertices.
 
         Parameters
         ----------
@@ -117,7 +117,7 @@ class Model2D():
         if N < 4:
             return None   # reject (too few vertices)
 
-        if N == 4 or N == 6:
+        if N == 4:
             return pts    # already the target size
 
         # iterative simplification
@@ -136,8 +136,7 @@ class Model2D():
                 pass
             pts = np.delete(pts, idx_remove, axis=0)
 
-        # if we undershot (possible when N=5 and target was 6) → force 4
-        if len(pts) not in (4, 6):
+        if len(pts) != 4:
             # last resort simplification to 4
             while len(pts) > 4:
                 angles = internal_angles(pts)
@@ -221,225 +220,18 @@ class Model2D():
         for (x, y) in poly.reshape(-1, 2):
             cv2.circle(canvas, (x, y), 4, (0, 0, 255), -1)
 
-        # Show the result
-        plt.figure(figsize=(6, 6))
-        plt.title(f"Polygon with {len(poly)} vertices")
-        plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        plt.axis("off")
+        # # Show the result
+        # plt.figure(figsize=(6, 6))
+        # plt.title(f"Polygon with {len(poly)} vertices")
+        # plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        # plt.axis("off")
 
-
-class VertexSolver:
-    def __init__(self):
-        pass
-
-    def find_missing_vertex(self, poly6, eps=np.deg2rad(12)):
-        """
-        Parameters
-        ----------
-        poly6 : (6,2) ndarray, clockwise silhouette vertices
-
-        Returns
-        -------
-        v      : (2,)  reconstructed vertex
-        debug  : dict  for drawing
-        """
-        P   = poly6.astype(float)
-        vec, length = _edge_vectors(P)
-
-        # ---- 1. choose the best opposite edge pair (longest & quasi‑parallel) --
-        pairs = [(0,3), (1,4), (2,5)]
-        i,j   = max(pairs,
-                    key=lambda ij: (length[ij[0]]+length[ij[1]])
-                    if _parallel_angle(vec[ij[0]], vec[ij[1]]) < eps else -1)
-
-        # anchor‑1 : vertex *before* edge i
-        a1_idx = (i-1) % 6
-        anchor1 = P[a1_idx]
-
-        # vanishing point of edges i and j
-        vp1 = _intersection(_line(P[i], P[(i+1)%6]),
-                            _line(P[j], P[(j+1)%6]))
-        if vp1 is None:
-            return None, {"fail": "vp1 at infinity"}
-
-        ray1 = _line(anchor1, vp1)
-
-        # ---- 2. anchor‑2 = anchor‑1 ± 2  (choose +2, clockwise) --------------
-        a2_idx = (a1_idx + 2) % 6
-        anchor2 = P[a2_idx]
-
-        # edges around anchor‑2 +- one edge → average their directions
-        v_left_idx = ((a2_idx-2)%6,(a2_idx-1)%6)
-        v_right_idx = ((a2_idx-2)%6,(a2_idx-1)%6)
-
-        print(f"Left: {v_left_idx} anchor-2: {a2_idx}, right: {v_right_idx}")
-
-        v_left  = P[v_left_idx[1]] - P[v_left_idx[0]]      # incoming
-        v_right = P[v_right_idx[1]] - P[v_right_idx[0]]      # outgoing
-        dir2    = v_left/np.linalg.norm(v_left) + v_right/np.linalg.norm(v_right)
-        dir2    /= np.linalg.norm(dir2)
-
-        # ray‑2 in homogeneous form: anchor2 + t*dir2
-        far_pt  = anchor2 + 10000*dir2             # a distant point in that dir
-        ray2    = _line(anchor2, far_pt)
-
-        # ---- 3. intersection of ray1 & ray2 = missing vertex ------------------
-        missing = _intersection(ray1, ray2)
-        if missing is None:
-            return None, {"fail": "rays parallel"}
-
-        debug = {
-            "anchor1_idx": a1_idx, "anchor1": anchor1,
-            "edge_i": i, "edge_j": j, "vp1": vp1,
-            "anchor2_idx": a2_idx, "anchor2": anchor2,
-            "dir2": dir2,
-            "missing": missing,
-            "ray1": ray1, "ray2": ray2
-        }
-        return missing.astype(np.float32), debug
-
-
-    def draw_vertex(self, mask, hexagon, debug):
-        """
-        Visualise rule‑2 reconstruction.
-
-        Colours
-        -------
-        green   : original hexagon
-        blue    : first edge pair + anchor‑1
-        orange  : edges at anchor‑2 + anchor‑2
-        red     : vanishing rays, missing vertex, helper lines
-        """
-        H, W = mask.shape
-        canvas = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
-        # 1) original hexagon --------------------------------------------------
-        cv2.polylines(canvas,
-                    [hexagon.reshape(-1,1,2).astype(int)],
-                    True, (0,255,0), 2)
-
-        # -------- keys from debug --------------------------------------------
-        a1   = debug["anchor1"].astype(int)
-        a2   = debug["anchor2"].astype(int)
-        i, j = debug["edge_i"], debug["edge_j"]           # first chosen pair
-        missing = debug["missing"].astype(int)
-
-        # 2) first chosen pair (BLUE) + anchor‑1 --------------------------------
-        for idx in (i, j):
-            p1, p2 = hexagon[idx], hexagon[(idx+1)%6]
-            cv2.line(canvas, tuple(p1.astype(int)), tuple(p2.astype(int)), (255,0,0), 2)
-        cv2.circle(canvas, tuple(a1), 6, (255,0,0), -1)
-
-        # 3) second anchor edges (ORANGE) ---------------------------------------
-        for idx in ((debug["anchor2_idx"]-1)%6, debug["anchor2_idx"]):
-            p1, p2 = hexagon[idx], hexagon[(idx+1)%6]
-            cv2.line(canvas, tuple(p1.astype(int)), tuple(p2.astype(int)), (0,165,255), 2)
-        cv2.circle(canvas, tuple(a2), 6, (0,165,255), -1)
-
-        # 4) vanishing ray‑1 (anchor‑1 → vp1)  ----------------------------------
-        vp1 = debug["vp1"]
-        if vp1 is not None:
-            seg = _clip_to_border(a1, vp1, W, H)
-            if len(seg)==2:
-                cv2.line(canvas, tuple(seg[0]), tuple(seg[1]), (0,0,255), 1, cv2.LINE_AA)
-
-        # 5) ray‑2 (anchor‑2 + dir2) -------------------------------------------
-        dir2 = debug["dir2"]
-        far  = (a2 + dir2*10000).astype(int)
-        seg2 = _clip_to_border(a2, far, W, H)
-        if len(seg2)==2:
-            cv2.line(canvas, tuple(seg2[0]), tuple(seg2[1]), (0,0,255), 1, cv2.LINE_AA)
-
-        # 6) missing vertex & helper lines -------------------------------------
-        cv2.circle(canvas, tuple(missing), 6, (0,0,255), -1)
-        cv2.line(canvas, tuple(a1), tuple(missing), (0,0,255), 2)
-        cv2.line(canvas, tuple(a2), tuple(missing), (0,0,255), 2)
-
-        # ----------------------------------------------------------------------
-        plt.figure(figsize=(6,6))
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        plt.imshow(rgb.astype(np.uint8))
-        plt.axis("off")
-        plt.show()
+        cv2.imwrite('poly.jpg', canvas)
 
 
 class Model3D:
     def __init__(self):
         self.brick_dims = BRICK_SIZE
-
-    def analyze_faces(self, image_pts: np.ndarray):
-        """
-        Analyze projected brick faces by edge angles and 2D area to identify best face candidate.
-
-        Parameters
-        ----------
-        image_pts : (7,2) float32 – polygon vertices including center (index 6)
-
-        Returns
-        -------
-        face_stats : list of dict – each with 'name', 'angle_deg', 'area', 'ratio'
-        best_face  : dict         – face most orthogonal (angle ≈ 90°)
-        """
-
-        # Define edges and face pairs (by index into image_pts)
-        # edge_pairs = [
-        #     ((0,6), (1,2)),   # front face
-        #     ((0,1), (6,2)),   # top face
-        #     ((2,6), (3,4)),   # right face
-        #     ((2,3), (6,4)),   # angled face
-        #     ((4,6), (0,5)),   # left face
-        #     ((4,5), (0,6))    # bottom face
-        # ]
-        edge_pairs = [
-            ((0,6), (1,2)),   # front face
-            # ((0,1), (6,2)),   # top face
-            ((2,6), (3,4)),   # right face
-            # ((2,3), (6,4)),   # angled face
-            ((4,6), (0,5)),   # left face
-            # ((4,5), (0,6))    # bottom face
-        ]        
-
-        def vector(p1, p2):
-            return image_pts[p2] - image_pts[p1]
-
-        def angle_between(u, v):
-            u = u / np.linalg.norm(u)
-            v = v / np.linalg.norm(v)
-            dot = np.clip(np.dot(u, v), -1, 1)
-            return np.arccos(dot)
-
-        def face_area(p1, p2, p3, p4):
-            quad = np.array([image_pts[p1], image_pts[p2], image_pts[p3], image_pts[p4]])
-            # Split into two triangles for robust area
-            a1 = 0.5 * np.abs(np.cross(quad[1] - quad[0], quad[2] - quad[0]))
-            a2 = 0.5 * np.abs(np.cross(quad[2] - quad[0], quad[3] - quad[0]))
-            return a1 + a2
-
-        face_stats = []
-
-        for ((i1, i2), (j1, j2)) in edge_pairs:
-            v1 = vector(i1, i2)
-            v2 = vector(i1, j1)
-            angle = angle_between(v1, v2)
-            angle_deg = np.degrees(angle)
-            print(f"({(i1, i2)})-{(i1, j1)}: {angle_deg}")
-            
-
-            # Estimate quadrilateral formed by (i1, i2, j2, j1)
-            area = face_area(i1, i2, j2, j1)
-            ratio = np.linalg.norm(vector(i1, i2)) / np.linalg.norm(vector(j1, j2))
-
-            face_stats.append({
-                "angle_deg": angle_deg,
-                "area": area,
-                "ratio": ratio,
-                "edge_pair": ((i1, i2), (j1, j2))
-            })
-
-        # Select face with angle closest to 90°
-        best_face = min(face_stats, key=lambda f: abs(f["angle_deg"] - 90))
-
-        return face_stats, best_face
 
     def get_brick_center(
         self,
@@ -472,53 +264,25 @@ class Model3D:
         a, b, c = sorted(self.brick_dims, reverse=True)
         image_pts = image_vertices.astype(np.float32)
 
-        face_stats, best_face = self.analyze_faces(image_pts)
 
-        print(f"Best face: {best_face}")
-        print(f"Edge pair: {best_face['edge_pair']}")
-        # Step 2: Estimate edge ratio for this face
-        i1, i2 = best_face['edge_pair'][0]
-        j1, j2 = best_face['edge_pair'][1]
-
-        l1 = np.linalg.norm(image_pts[i1] - image_pts[i2])
-        l2 = np.linalg.norm(image_pts[i1] - image_pts[j1])
+        l1 = np.linalg.norm(image_pts[1] - image_pts[0])
+        l2 = np.linalg.norm(image_pts[2] - image_pts[1])
         edge_ratio = max(l1, l2) / min(l1, l2)
-        print(f"Best pair edge_ratio: {edge_ratio}")
+        
 
-        ratios_diff = {
-            "a-b": abs(max(a, b) / min(a, b) - edge_ratio),
-            "a-c": abs(max(a, c) / min(a, c) - edge_ratio),
-            "b-c": abs(max(b, c) / min(b, c) - edge_ratio)
-        }
+        if edge_ratio < 1:
+            print(f"Edge length ratio: {edge_ratio} < 1. Permuting points...")
+            new_pts = [image_pts[i] for i in range(1, len(image_pts))]
+            new_pts.append(image_pts[0])
+            image_pts = np.array(new_pts)
 
-        print(f"a/b/c ratios: {ratios_diff}")
-
-        face_type = min(ratios_diff, key=ratios_diff.get)
-
-        print(f"Identified face type: {face_type}")
-
-        # Step 3: Assign 3D box corners based on face type
-        face_dims = {
-            "a-b": (a, b, c),
-            "a-c": (c, a, b),
-            "b-c": (b, c, a)
-        }
-
-        a_, b_, c_ = face_dims[face_type]
 
         object_pts = np.array([
             [0, 0, 0],
-            [a_, 0, 0],
-            [a_, b_, 0],
-            [a_, b_, c_],
-            [0, b_, c_],
-            [0, 0, c_]
+            [a, 0, 0],
+            [0, b, 0],
+            [a, b, 0]
         ], dtype=np.float32)
-
-        # Orientation check
-        area2d = poly_area_2d(image_pts)
-        normal3d_z = face_normal_3d(object_pts)[2]
-        orientation_ok = (area2d > 0 and normal3d_z > 0) or (area2d < 0 and normal3d_z < 0)
 
         # Ray and depth
         fx, fy, cx, cy = (intrinsics[k] for k in ("fx", "fy", "cx", "cy"))
@@ -532,7 +296,7 @@ class Model3D:
         if 0 <= v_int < H and 0 <= u_int < W:
             depth_c = float(depth_map[v_int, u_int])
 
-        return image_pts, object_pts, orientation_ok, ray, depth_c, face_type
+        return image_pts, object_pts, ray, depth_c
 
 
 
@@ -588,11 +352,11 @@ class Model3D:
         if not ok:
             raise RuntimeError("Initial solvePnP failed")
 
-        # --- enforce depth -----------------------------------------------------
-        t_norm = np.linalg.norm(tvec)
-        if not np.isnan(depth_centroid) and abs(t_norm - depth_centroid) > depth_tol * depth_centroid:
-            scale = depth_centroid / t_norm
-            tvec *= scale  # scale translation to match measured depth
+        # # --- enforce depth -----------------------------------------------------
+        # t_norm = np.linalg.norm(tvec)
+        # if not np.isnan(depth_centroid) and abs(t_norm - depth_centroid) > depth_tol * depth_centroid:
+        #     scale = depth_centroid / t_norm
+        #     tvec *= scale  # scale translation to match measured depth
 
 
 

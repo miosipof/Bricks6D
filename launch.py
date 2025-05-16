@@ -8,7 +8,7 @@ from PIL import Image
 
 from src.detect import Detection
 from src.segment import Segmentation
-from src.geometry import Model2D, VertexSolver, Model3D
+from src.geometry import Model2D, Model3D
 
 
 device = "cpu"
@@ -42,15 +42,26 @@ device = "cpu"
 # detector.vis_box(bboxes[0], orig_img)
 
 
-segmentator = Segmentation(sam2_checkpoint_name='sam2.1_hiera_large.pt', 
-                           sam2_config_name='sam2.1_hiera_l.yaml', 
-                           threshold=1e-4, 
-                           area_threshold=0.5)
+# segmentator = Segmentation(sam2_checkpoint_name='sam2.1_hiera_large.pt', 
+#                            sam2_config_name='sam2.1_hiera_l.yaml', 
+#                            threshold=1e-4, 
+#                            area_threshold=0.5)
 
 
-image_path = 'brick_1.jpg'
-# image_path = '7_crop.jpg'
-bin_mask, mask, image_pil = segmentator.create_mask(image_path, visualize=True)
+# image_path = 'brick_1.jpg'
+image_path = '7.jpg'
+image_pil = Image.open(image_path).convert("RGB")
+
+mask_path = '7_mask_0.png'
+mask = Image.open(mask_path)
+mask = np.array(mask)
+if len(mask.shape) == 3:
+    mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY) 
+_, bin_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+# bin_mask, mask, image_pil = segmentator.create_mask(image_path, visualize=True)
+
+
 
 plane_model = Model2D()
 best_cnt, best_poly = plane_model.create_poly(bin_mask, image_pil, visualize=True)
@@ -58,39 +69,27 @@ best_cnt, best_poly = plane_model.create_poly(bin_mask, image_pil, visualize=Tru
 print(f"Polygon shape: {best_poly.shape}")
 
 
-hexagon = plane_model.create_hexagon(best_poly)
-print(f"Simplified polygon shape: {hexagon.shape}")
+image_vertices = plane_model.create_hexagon(best_poly)
+print(f"Simplified polygon shape: {image_vertices.shape}")
 # print(f"Simplified polygon points: {hexagon}")
 
-plane_model.vis_poly(bin_mask, np.int32(hexagon.reshape(hexagon.shape[0],1,2)))
-
-vertex_solver = VertexSolver()
-vertex, debug = vertex_solver.find_missing_vertex(hexagon)
-print(f"Solved for missing vertex: {vertex}")
-vertex_solver.draw_vertex(mask, hexagon, debug)
+plane_model.vis_poly(bin_mask, np.int32(image_vertices.reshape(image_vertices.shape[0],1,2)))
 
 world_model = Model3D()
 
 with open('7.json', 'r') as f:
     intrinsics = json.load(f)
 
-# depth_path = '7_crop.png'
-# depth_map = Image.open(depth_path)
-# depth_map = np.array(depth_map)
-# depth_map = depth_map/(1e-5+np.max(depth_map))
+depth_path = '7.png'
+depth_map = Image.open(depth_path)
+depth_map = np.array(depth_map)
+depth_map = depth_map/(1e-5+np.max(depth_map))
 
-h,w = image_pil.size
-depth_map = np.full((h,w), 1.0, dtype=np.float32)
+image_pts, object_pts, ray, depth_c = world_model.get_brick_center(image_vertices, depth_map, intrinsics)
 
-image_vertices = np.vstack([hexagon, np.round(vertex)])
-# image_vertices = hexagon
+world_model.draw_vertex_labels(image_pil, image_pts, object_pts)
 
-img_pts, obj_pts, orient_ok, ray, depth_c, face_type = world_model.get_brick_center(image_vertices, depth_map, intrinsics)
+R, tvec, normal = world_model.solve_brick_pose(image_pts, object_pts, intrinsics, depth_c, ray)
 
-world_model.draw_vertex_labels(image_pil, img_pts, obj_pts)
-
-img_pts = img_pts[:-1]
-R, tvec, normal = world_model.solve_brick_pose(img_pts, obj_pts, intrinsics, depth_c, ray)
-
-world_model.project_brick(R, tvec, normal, img_pts, obj_pts, intrinsics, image_pil)
+world_model.project_brick(R, tvec, normal, image_pts, object_pts, intrinsics, image_pil)
 world_model.draw_normal_vector(image_pil, tvec, normal, intrinsics)
