@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 import logging
+from ultralytics import YOLO
 
 # from .. import sam2
 from sam2.utils.track_utils import sample_points_from_masks
@@ -20,8 +21,53 @@ log = logging.getLogger(__name__)
 
 
 
+class YOLOSegmentation:
+    def __init__(self, yolo_ckpt='yolo_seg.pt'):
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = YOLO(os.path.join('resources',yolo_ckpt))
+        self.model.to('cpu')
+        self.model.eval()
 
-class Segmentation():
+
+    def create_masks(self, img_path, vis=False):
+
+        results = self.model(img_path)
+
+        for result in results:
+            # Get the height and width of the original image
+            h, w = result.orig_img.shape[:2]
+
+            # Create the background
+            background = np.ones((h, w, 3), dtype=np.uint8) * 255
+            # Get all predicted masks
+            masks = result.masks.xy
+            # Get the original image
+            orig_img = result.orig_img
+
+            mask_imgs = []
+            for i, mask in enumerate(masks):
+
+                mask = mask.astype(int)
+
+                # Create a mask image
+                mask_img = np.zeros_like(orig_img)
+                # Fill the contour of the mask image in white
+                cv2.fillPoly(mask_img, [mask], (255, 255, 255))
+                Image.fromarray((mask_img).astype(np.uint8)).save(img_path.replace('.jpg',f'_mask_{i}.png'))
+                mask_imgs.append(mask_img)
+
+                # Extract the object from the original image using the mask
+                masked_object = cv2.bitwise_and(orig_img, mask_img)
+                # Copy the masked object to the background image
+                background[mask_img == 255] = masked_object[mask_img == 255]
+
+        if vis:
+            cv2.imwrite(img_path.replace('.jpg','_vis.png'), background)
+
+        return mask_imgs
+
+
+class SAMSegmentation():
     def __init__(self, sam2_checkpoint_name='sam2.1_hiera_large.pt', sam2_config_name='sam2.1_hiera_l.yaml', threshold=1e-4, area_threshold=0.5):
         self.device = ("cuda" if torch.cuda.is_available() else "cpu")
         self.threshold = threshold # Threshold for binary mask

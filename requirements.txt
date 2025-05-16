@@ -91,3 +91,4 @@ uvicorn===0.34.2
 websockets==15.0.1
 yapf===0.43.0
 ultralytics==8.3.120
+open3d

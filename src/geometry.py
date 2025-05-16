@@ -2,14 +2,16 @@ import cv2
 import numpy as np
 import logging
 import matplotlib.pyplot as plt
-from PIL import Image
-
+from PIL import Image, ImageDraw
+import json
 from resources.constants import MIN_AREA_PX, ASPECT_MIN, ASPECT_MAX, VERTEX_MIN, VERTEX_MAX, BRICK_SIZE
+import open3d as o3d
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
 
+###______________________________________________________________________
 
 class Model2D():
     def __init__(self):
@@ -147,9 +149,6 @@ class Model2D():
 
         return pts.astype(np.float32)
 
-
-
-
     
     def split_brick_face(self, hexagon: np.ndarray):
         """
@@ -229,282 +228,307 @@ class Model2D():
         cv2.imwrite('poly.jpg', canvas)
 
 
+    def shrink_polygon(self, polygon, shrink_factor=0.5):
+        """
+        Shrinks a 4-point polygon (np.array shape (4,2)) toward its centroid.
+        """
+        centroid = np.mean(polygon, axis=0)
+        return centroid + shrink_factor * (polygon - centroid)
+
+    def polygon_to_mask(self, image_shape, polygon):
+        mask = np.zeros(image_shape, dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 1)
+        return mask
+
+###______________________________________________________________________
+
 class Model3D:
     def __init__(self):
         self.brick_dims = BRICK_SIZE
 
-    def get_brick_center(
-        self,
-        image_vertices: np.ndarray,
-        depth_map: np.ndarray,
-        intrinsics: dict
-    ):
-        """
-        Determines the most front-facing face from a 6-vertex polygon and computes the camera-to-brick geometry.
+    def load_k(self, json_path):
+        # Load camera parameters
+        with open(json_path, 'r') as f:
+            intrinsics = json.load(f)
 
-        Returns
-        -------
-        image_pts      : (6,2) float32   pixel coordinates (CCW)
-        object_pts     : (6,3) float32   inferred 3D coordinates
-        orientation_ok : bool           winding consistency
-        ray_centroid   : (3,) float64   unit ray from camera to centroid
-        depth_c        : float          depth at centroid (may be NaN)
-        face_type      : str            e.g. "a-b", "a-c", or "b-c"
-        """
-
-        def poly_area_2d(pts):
-            pts = np.vstack([pts, pts[0]])
-            return 0.5 * np.sum(pts[:-1, 0] * pts[1:, 1] - pts[1:, 0] * pts[:-1, 1])
-
-        def face_normal_3d(pts):
-            v1 = pts[1] - pts[0]
-            v2 = pts[2] - pts[0]
-            return np.cross(v1, v2)
-
-        a, b, c = sorted(self.brick_dims, reverse=True)
-        image_pts = image_vertices.astype(np.float32)
-
-
-        l1 = np.linalg.norm(image_pts[1] - image_pts[0])
-        l2 = np.linalg.norm(image_pts[2] - image_pts[1])
-        edge_ratio = max(l1, l2) / min(l1, l2)
-        
-
-        if edge_ratio < 1:
-            print(f"Edge length ratio: {edge_ratio} < 1. Permuting points...")
-            new_pts = [image_pts[i] for i in range(1, len(image_pts))]
-            new_pts.append(image_pts[0])
-            image_pts = np.array(new_pts)
-
-
-        object_pts = np.array([
-            [0, 0, 0],
-            [a, 0, 0],
-            [0, b, 0],
-            [a, b, 0]
-        ], dtype=np.float32)
-
-        # Ray and depth
-        fx, fy, cx, cy = (intrinsics[k] for k in ("fx", "fy", "cx", "cy"))
-        uc, vc = image_pts.mean(axis=0)
-        ray = np.array([(uc - cx) / fx, (vc - cy) / fy, 1.0])
-        ray /= np.linalg.norm(ray)
-
-        H, W = depth_map.shape
-        u_int, v_int = int(round(uc)), int(round(vc))
-        depth_c = np.nan
-        if 0 <= v_int < H and 0 <= u_int < W:
-            depth_c = float(depth_map[v_int, u_int])
-
-        return image_pts, object_pts, ray, depth_c
-
-
-
-    def solve_brick_pose(self,
-                         image_pts: np.ndarray,
-                        object_pts: np.ndarray,
-                        intrinsics: dict,
-                        depth_centroid: float,
-                        ray_to_centroid: np.ndarray,
-                        depth_tol: float = 0.02):
-        """
-        Solve 6‑DoF pose of the brick given 2‑D/3‑D correspondences and a depth prior.
-
-        Parameters
-        ----------
-        image_pts       : (N,2) float32   – pixel coordinates (CCW order)
-        object_pts      : (N,3) float32   – matching brick coordinates in metres
-        intrinsics      : dict            – {"fx":..,"fy":..,"cx":..,"cy":..}
-        depth_centroid  : float           – depth (m) at polygon centroid
-        ray_to_centroid : (3,) float64    – unit vector camera → centroid
-        depth_tol       : float           – acceptable |t|-depth error fraction
-
-        Returns
-        -------
-        R   : (3,3)  rotation matrix (camera→brick)
-        t   : (3,1)  translation vector (metres)
-        n   : (3,)   outward normal (unit, pointing toward camera)
-        """
         fx, fy, cx, cy = (intrinsics[k] for k in ("fx","fy","cx","cy"))
-
         K = np.array([[fx, 0, cx],
                     [0, fy, cy],
-                    [0,  0,  1]], dtype=np.float64)
+                    [0,  0,  1]], dtype=np.float64)        
+        return K
 
-        # --- initial PnP -------------------------------------------------------
-        if len(image_pts) == 4:
-            flag = cv2.SOLVEPNP_IPPE_SQUARE
+
+    def project_face(self, depth_png16, mask, K, scale=0.001):
+        """
+        depth_png16 : uint16 ndarray, metric depth after multiplying by `scale`
+        mask        : uint8 ndarray, 1 = face pixel, 0 = background
+        K           : (3,3) camera matrix  [[fx, 0, cx],
+                                            [0, fy, cy],
+                                            [0,  0,  1]]
+        scale       : real-world metres per DN in the PNG  (0.001 for mm→m)
+        returns     : (N,3) array of 3-D points in camera frame
+        """
+        # 1-a extract pixel indices inside the mask
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            raise ValueError("mask empty")
+
+        # 1-b vectorised back-projection
+        z = depth_png16[ys, xs].astype(np.float32) * scale
+        # optional filter: throw away z==0 or >sensor range
+        keep = z > 0
+        xs, ys, z = xs[keep], ys[keep], z[keep]
+
+        # intrinsic parameters
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+
+        # X = (u − cx) * Z / fx ;  Y = (v − cy) * Z / fy
+        X = (xs - cx) * z / fx
+        Y = (ys - cy) * z / fy
+        pts = np.column_stack((X, Y, z))
+        return pts
+
+
+    def fit_plane(self, points, ransac_thresh=0.004, min_inliers=300):
+        """
+        points : (N,3) ndarray
+        returns (centroid, normal, inlier_mask)
+        """
+        # ----- optional RANSAC to kill depth outliers -----
+        best_inliers = None
+        rng = np.random.default_rng()
+        for _ in range(50):
+            sample = points[rng.choice(points.shape[0], 3, replace=False)]
+            n = np.cross(sample[1]-sample[0], sample[2]-sample[0])
+            n /= np.linalg.norm(n) + 1e-8
+            d = -sample[0].dot(n)
+            dist = np.abs(points.dot(n) + d)
+            inliers = dist < ransac_thresh
+            if best_inliers is None or inliers.sum() > best_inliers.sum():
+                best_inliers = inliers
+        pts_in = points[best_inliers] if best_inliers.sum() >= min_inliers else points
+
+        # ----- PCA/SVD on inliers -----
+        centroid = pts_in.mean(axis=0)
+        Q = pts_in - centroid
+        U, S, vh = np.linalg.svd(Q, full_matrices=False)
+        print("SVD singular values:", S)
+        print("Flatness score (S[1]/S[2]):", S[1] / S[2])
+        normal = vh[-1]                      # eigenvector with smallest eigenvalue
+        # make it point *towards* the camera (positive z)
+        if normal[2] > 0:
+            normal = -normal
+        normal /= np.linalg.norm(normal)     # ensure unit length
+        return centroid, normal, best_inliers
+
+
+    def fit_axis(self, mask):
+        ys, xs = np.nonzero(mask)
+        Q = np.column_stack((xs - xs.mean(), ys - ys.mean()))
+        _, _, vh = np.linalg.svd(Q, full_matrices=False)
+        axis_2d = vh[0]               # in-plane direction of longest extent
+        # yaw = arctan2(axis_2d.y, axis_2d.x)   # if you need it
+        return axis_2d
+
+
+    def vis_plane(self, pts_in, centroid, normal, mask=None, K=None, patch_size=0.1):
+        """
+        Visualizes:
+        - the 3D inlier points
+        - a coordinate frame at the centroid
+        - a square patch aligned with the fitted plane normal
+
+        Args:
+            pts_in: (N,3) inlier 3D points
+            centroid: (3,) center of fitted plane
+            normal: (3,) unit normal vector of plane
+            mask: optional 2D mask to compute in-plane axes
+            K: optional camera intrinsics
+            patch_size: width/height of visual plane patch in meters
+        """
+        # 1. Point cloud
+        cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts_in))
+
+        # 2. Coordinate frame at centroid
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+        frame.translate(centroid)
+
+        # 3. Construct local frame {vx, vy, normal}
+        z = normal / np.linalg.norm(normal)
+        if mask is not None and K is not None:
+            # Use 2D PCA to get brick orientation
+            ys, xs = np.nonzero(mask)
+            pts_2d = np.stack((xs - xs.mean(), ys - ys.mean()), axis=1)
+            _, _, vh = np.linalg.svd(pts_2d, full_matrices=False)
+            dir2d = vh[0]
+            fx, fy = K[0,0], K[1,1]
+            vx = np.array([dir2d[0] / fx, dir2d[1] / fy, 0.0])
+            vx -= vx.dot(z) * z
+            vx /= np.linalg.norm(vx)
         else:
-            flag = cv2.SOLVEPNP_ITERATIVE
+            # Arbitrary orthogonal tangent
+            ref = np.array([1, 0, 0]) if abs(z[0]) < 0.9 else np.array([0, 1, 0])
+            vx = ref - ref.dot(z) * z
+            vx = vx / np.linalg.norm(vx)
 
-        ok, rvec, tvec = cv2.solvePnP(
-            object_pts, image_pts, K, None,
-            flags=flag
-        )
-        # ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-        #     object_pts, image_pts, K, None,
-        #     flags=flag,
-        #     reprojectionError=4.0,
-        #     confidence=0.99,
-        #     iterationsCount=100
-        # )
+        vy = np.cross(z, vx)
+        R = np.column_stack((vx, vy, z))  # 3×3 rotation matrix
 
-        if not ok:
-            raise RuntimeError("Initial solvePnP failed")
+        # 4. Create box patch and rotate/translate
+        box = o3d.geometry.TriangleMesh.create_box(width=patch_size, height=patch_size, depth=0.001)
 
-        # # --- enforce depth -----------------------------------------------------
-        # t_norm = np.linalg.norm(tvec)
-        # if not np.isnan(depth_centroid) and abs(t_norm - depth_centroid) > depth_tol * depth_centroid:
-        #     scale = depth_centroid / t_norm
-        #     tvec *= scale  # scale translation to match measured depth
+        box.translate(-box.get_center())  # center at origin
+        box.rotate(R, center=(0, 0, 0))
+        box.translate(centroid)
+        box.paint_uniform_color([0.8, 0.3, 0.3])  # reddish patch
 
-
-
-        # (Optional) refine rotation with translation fixed
-        ok2, rvec, _ = cv2.solvePnP(
-            object_pts, image_pts, K, None,
-            useExtrinsicGuess=True,
-            rvec=rvec, tvec=tvec,
-            flags=flag
-        )
-
-        R, _ = cv2.Rodrigues(rvec)
-
-        # --- face normal (3rd column) -----------------------------------------
-        n = R[:, 2]
-        # ensure normal points toward camera (n·t < 0)
-        if np.dot(n.flatten(), tvec.flatten()) > 0:
-            n = -n
-
-        return R, tvec, n
-
-
-    def project_brick(self, R, tvec, normal, img_pts, obj_pts, intrinsics, image_pil):
-
-        # Reproject the 3D object points to 2D image points
-
-        rvec, _ = cv2.Rodrigues(R)  # Convert rotation matrix to rotation vector
-
-        # Project the 3D points using the camera intrinsics and pose
-        projected_pts, _ = cv2.projectPoints(
-            objectPoints=obj_pts,
-            rvec=rvec,
-            tvec=tvec,
-            cameraMatrix=np.array([
-                [intrinsics["fx"], 0, intrinsics["cx"]],
-                [0, intrinsics["fy"], intrinsics["cy"]],
-                [0, 0, 1]
-            ]),
-            distCoeffs=None
-        )
-        # Flatten projected points for drawing
-        projected_pts = projected_pts.squeeze().astype(np.int32)
-
-        # Create canvas for visualization
-        canvas = np.array(image_pil)
-
-        # Draw reprojected polygon
-        cv2.polylines(canvas, [projected_pts.reshape(-1, 1, 2)], isClosed=True, color=(0, 0, 255), thickness=2)
-
-        # Draw original image polygon
-        cv2.polylines(canvas, [img_pts.astype(int).reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 0), thickness=2)
-
-        # Display
-        import matplotlib.pyplot as plt
-
-        plt.figure(figsize=(6, 6))
-        plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        plt.title("Projected 3D Brick Pose (Red) vs. Original Image Polygon (Green)")
-        plt.axis("off")
-        plt.show()
+        # 5. Visualize all
+        o3d.visualization.draw_geometries([cloud, frame, box])
 
 
 
 
-    def draw_vertex_labels(self, image_pil, image_pts, object_pts):
+    def project_to_img(self, points_3d, K):
         """
-        Draws numbered circles on the image at image_pts locations and displays image_pts ↔ object_pts mapping.
-
-        Parameters
-        ----------
-        image       : (H,W,3) BGR image
-        image_pts   : (N,2) float32 pixel coordinates
-        object_pts  : (N,3) float32 3D brick coordinates
+        Project 3D points onto the image plane.
+        points: (N, 3) ndarray in camera frame
+        K: (3, 3) camera intrinsics
+        Returns: (N, 2) ndarray of pixel coordinates
         """
-        canvas = np.array(image_pil)
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        X, Y, Z = points_3d[:,0], points_3d[:,1], points_3d[:,2]
+        u = (X * fx / Z + cx).astype(np.int32)
+        v = (Y * fy / Z + cy).astype(np.int32)
+        return np.stack((u, v), axis=-1)
 
-        for i, pt in enumerate(image_pts):
-            u, v = int(pt[0]), int(pt[1])
-            cv2.circle(canvas, (u, v), radius=5, color=(0, 255, 0), thickness=-1)
-            cv2.putText(canvas, str(i), (u + 8, v - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0, 255, 255), 2, cv2.LINE_AA)
-
-        # Print 2D–3D mapping clearly
-        print(" Index |  image_pts (u, v)   |  object_pts (x, y, z)")
-        print("-------+---------------------+------------------------")
-        for i, (img_pt, obj_pt) in enumerate(zip(image_pts, object_pts)):
-            u, v = img_pt
-            x, y, z = obj_pt
-            print(f"  {i:>3}  |  ({u:7.1f}, {v:7.1f})  |  ({x:6.3f}, {y:6.3f}, {z:6.3f})")
-
-        # Show the image
-        plt.figure(figsize=(6, 6))
-        plt.imshow(cv2.cvtColor(canvas.astype(np.uint8), cv2.COLOR_BGR2RGB))
-        plt.title("2D Vertex Indices and 3D Mapping")
-        plt.axis("off")
-        plt.show()
-
-
-    def draw_normal_vector(self, image_pil, tvec, normal, intrinsics, length=0.05, color=(0, 0, 255), thickness=2):
+    def draw_points(self, image_pil, points_2d, color=(255, 0, 0), radius=2):
         """
-        Projects and draws the 3D surface normal onto a 2D image.
-
-        Parameters
-        ----------
-        image       : np.ndarray   – Input image (BGR or grayscale)
-        tvec        : (3,1) float  – Translation vector from solvePnP (brick center in camera frame)
-        normal      : (3,) float   – Unit normal vector in camera coordinates
-        intrinsics  : dict         – {"fx", "fy", "cx", "cy"}
-        length      : float        – Arrow length in meters (default 5 cm)
-        color       : (B,G,R)      – Arrow color (default red)
-        thickness   : int          – Arrow thickness (default 2)
+        Draw 2D points on a PIL image.
         """
+        image_pil = image_pil.convert("RGB")
+        draw = ImageDraw.Draw(image_pil)
+        w, h = image_pil.size
+        for (u, v) in points_2d:
+            if 0 <= u < w and 0 <= v < h:
+                draw.ellipse([(u - radius, v - radius), (u + radius, v + radius)], fill=color)
 
-        # Convert intrinsics to matrix
-        fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
-        K = np.array([
-            [fx, 0, cx],
-            [0, fy, cy],
-            [0,  0,  1]
-        ], dtype=np.float64)
-
-        # Project 3D center and tip of normal
-        tip3D = (tvec.reshape(3) + length * normal).reshape(3, 1)
-        tvec = tvec.reshape(3, 1)
-
-        pt1, _ = cv2.projectPoints(tvec, np.zeros(3), np.zeros(3), K, None)
-        pt2, _ = cv2.projectPoints(tip3D, np.zeros(3), np.zeros(3), K, None)
-
-        p1 = tuple(pt1[0, 0].astype(int))
-        p2 = tuple(pt2[0, 0].astype(int))
-
-        # Prepare canvas
-        canvas = np.array(image_pil)
-        if len(canvas.shape) == 2 or canvas.shape[2] == 1:
-            canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
-
-        # Draw arrow
-        cv2.arrowedLine(canvas, p1, p2, color=color, thickness=thickness, tipLength=0.1)
-
-        # Display
-        plt.figure(figsize=(8, 6))
-        plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        plt.title("Projected Normal Vector")
-        plt.axis("off")
-        plt.show()
+        return image_pil
+    
 
 
+    def vis_pose(self, image_pil, mask, centroid_3d, normal_3d, axis_2d, K,
+                                scale=1.0, color_centroid=(255, 0, 0),
+                                color_normal=(0, 0, 255), color_axis=(255, 255, 0)):
+        """
+        Overlays:
+        - centroid point
+        - normal vector projected into 2D
+        - axis_2d direction (from mask shape)
 
+        Args:
+            image_pil: PIL image
+            mask: 2D binary mask
+            centroid_3d: np.array (3,)
+            normal_3d: np.array (3,)
+            axis_2d: np.array (2,)
+            K: camera intrinsics matrix
+            scale: how long the arrows should be in pixels
+        """
+        image = image_pil.copy().convert("RGB")
+        draw = ImageDraw.Draw(image)
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+
+        # --- Project centroid to image ---
+        X, Y, Z = centroid_3d
+        u = int(X * fx / Z + cx)
+        v = int(Y * fy / Z + cy)
+
+        # --- Draw centroid ---
+        r = 4
+        draw.ellipse([(u - r, v - r), (u + r, v + r)], fill=color_centroid)
+
+        # --- Project normal vector ---
+        normal_2d = np.array([
+            normal_3d[0] * fx / Z,
+            normal_3d[1] * fy / Z
+        ])
+        end_norm = (int(u + scale * normal_2d[0]), int(v + scale * normal_2d[1]))
+        draw.line([(u, v), end_norm], fill=color_normal, width=2)
+
+        # --- Draw in-plane axis_2d ---
+        axis_2d_norm = axis_2d / np.linalg.norm(axis_2d)
+        end_axis = (int(u + scale * axis_2d_norm[0]), int(v + scale * axis_2d_norm[1]))
+        draw.line([(u, v), end_axis], fill=color_axis, width=2)
+
+
+        image.save('pose_vis.jpg')
+        image.show()        
+
+        return image
+
+
+    def overlay_points(self, image_pil, pts_3d, centroid, normal, K, patch_size=0.1):
+        """
+        Overlays 3D inlier points and the fitted plane patch onto the image.
+
+        Args:
+            image_pil: PIL.Image (RGB)
+            pts_3d: (N,3) inlier 3D points
+            centroid: (3,) np.array
+            normal: (3,) np.array
+            K: (3,3) camera intrinsics
+            patch_size: plane size in meters
+        Returns:
+            PIL.Image with overlay
+        """
+        from PIL import ImageDraw
+        image = image_pil.copy().convert("RGB")
+        draw = ImageDraw.Draw(image)
+
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+
+        def project(p3d):
+            x, y, z = p3d
+            u = int(x * fx / z + cx)
+            v = int(y * fy / z + cy)
+            return u, v
+
+        # 1. Draw projected 3D points
+        for p in pts_3d:
+            u, v = project(p)
+            draw.ellipse([(u-1, v-1), (u+1, v+1)], fill=(255, 0, 0))
+
+        # 2. Draw plane patch (projected square)
+        # Create plane-aligned frame
+        z = normal / np.linalg.norm(normal)
+        x0 = np.array([1, 0, 0]) if abs(z[0]) < 0.9 else np.array([0, 1, 0])
+        vx = x0 - x0.dot(z) * z
+        vx /= np.linalg.norm(vx)
+        vy = np.cross(z, vx)
+
+        # 4 corner points in local frame
+        s = patch_size / 2
+        corners_local = np.array([
+            [-s, -s, 0],
+            [ s, -s, 0],
+            [ s,  s, 0],
+            [-s,  s, 0],
+        ])
+        R = np.column_stack((vx, vy, z))
+        corners_3d = (R @ corners_local.T).T + centroid
+        corners_2d = [project(p) for p in corners_3d]
+
+        # Draw polygon
+        draw.polygon(corners_2d, outline=(0, 255, 0), width=2)
+
+        return image
+
+
+
+
+
+
+###______________________________________________________________________
 
 """
 Helper functions 2D
@@ -571,17 +595,8 @@ def _intersection(l1, l2, eps=1e-7):
     p = np.cross(l1, l2)
     return None if abs(p[2]) < eps else p[:2]/p[2]
 
-
+###______________________________________________________________________
 
 """
 Helper functions 3D
 """
-
-def poly_area_2d(pts):
-    xy = np.vstack([pts, pts[0]])
-    return 0.5*np.sum(xy[:-1,0]*xy[1:,1] - xy[1:,0]*xy[:-1,1])
-
-def face_normal_3d(pts):
-    v1 = pts[1]-pts[0]
-    v2 = pts[2]-pts[0]
-    return np.cross(v1,v2)
